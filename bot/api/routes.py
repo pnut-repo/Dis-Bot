@@ -16,6 +16,7 @@ Endpoints:
 import json
 import logging
 import os
+import hashlib
 
 import jwt
 import requests
@@ -237,14 +238,17 @@ def log_audit_event(event: AuditEvent, request: Request):
     )
 
     # Build audit payload
+    raw_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown")
+    raw_meta = json.dumps(event.event_meta) if event.event_meta else "{}"
+    
     payload = {
         "clerk_user_id": clerk_user_id,
-        "email": email,
+        "email": hashlib.sha256(email.encode("utf-8")).hexdigest(),
         "display_name": display_name,
         "nickname": nickname,
         "event_type": event.event_type,
-        "event_meta": json.dumps(event.event_meta) if event.event_meta else "{}",
-        "ip_address": request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown"),
+        "event_meta": json.dumps({"hashed": hashlib.sha256(raw_meta.encode("utf-8")).hexdigest()}),
+        "ip_address": hashlib.sha256(raw_ip.encode("utf-8")).hexdigest(),
         "user_agent": request.headers.get("user-agent", "unknown"),
     }
 
