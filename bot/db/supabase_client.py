@@ -35,11 +35,17 @@ def insert_message(payload: dict) -> None:
     """
     Insert a single Discord message into the messages table.
 
+    Uses upsert with ignore_duplicates so that if the bot restarts and
+    Discord replays recent messages, duplicates are silently skipped
+    instead of raising a 23505 unique-constraint error.
+
     Payload shape (mirrors Supabase messages schema):
         message_id, user_id, username, display_name, content,
         created_at, has_attachment, is_reply, reply_to_id
     """
-    get_client().table("messages").insert(payload).execute()
+    get_client().table("messages").upsert(
+        payload, on_conflict="message_id", ignore_duplicates=True
+    ).execute()
 
 
 def fetch_messages_for_date(date_str: str) -> list[dict]:
