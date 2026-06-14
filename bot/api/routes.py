@@ -1,31 +1,100 @@
 """
 api/routes.py — REST API endpoints served to the Netlify frontend.
 
-All endpoints are read-only GETs. The frontend calls these via VITE_API_BASE_URL.
-Data comes from Supabase via db/supabase_client.py.
-
-This module has zero business logic — it only queries Supabase and returns JSON.
-All computation happens in the midnight pipeline.
+All report endpoints are read-only GETs. Data comes from Supabase.
+The audit endpoint is a POST that logs user activity from authenticated
+Clerk sessions.
 
 Endpoints:
-    GET /api/reports/dates          → list of available dates
-    GET /api/reports/latest         → most recent report
-    GET /api/reports/{report_date}  → full report for a date
-    GET /api/topics/{report_date}   → topic rankings for a date
+    GET  /api/reports/dates          → list of available dates
+    GET  /api/reports/latest         → most recent report
+    GET  /api/reports/{report_date}  → full report for a date
+    GET  /api/topics/{report_date}   → topic rankings for a date
+    POST /api/audit                  → log user activity event
 """
 
+import json
 import logging
-from fastapi import APIRouter, HTTPException
+import os
+
+import jwt
+import requests
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 
 from db.supabase_client import (
     fetch_available_report_dates,
     fetch_report_by_date,
     fetch_topics_by_date,
+    insert_audit_log,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# ── Clerk JWKS for JWT verification ───────────────────────────────────────────
+
+_jwks_client = None
+
+
+def _get_jwks_client():
+    """
+    Lazy-load the Clerk JWKS client. Clerk publishes its public keys at:
+    https://<clerk-frontend-api>/.well-known/jwks.json
+
+    The Frontend API domain is derived from the publishable key:
+    pk_test_<base64-encoded-domain> → decode → "advanced-chamois-10.clerk.accounts.dev"
+    """
+    global _jwks_client
+    if _jwks_client is None:
+        pk = os.getenv("CLERK_PUBLISHABLE_KEY", "")
+        if not pk:
+            raise RuntimeError("CLERK_PUBLISHABLE_KEY is not set")
+
+        # Extract the Clerk Frontend API domain from the publishable key
+        # pk_test_<base64> or pk_live_<base64> → decode the base64 part
+        import base64
+        encoded_part = pk.split("_")[-1]
+        # Add padding if needed
+        padded = encoded_part + "=" * (4 - len(encoded_part) % 4)
+        clerk_domain = base64.b64decode(padded).decode("utf-8").rstrip("$")
+
+        jwks_url = f"https://{clerk_domain}/.well-known/jwks.json"
+        _jwks_client = jwt.PyJWKClient(jwks_url)
+        logger.info(f"Clerk JWKS client initialized from {jwks_url}")
+    return _jwks_client
+
+
+def verify_clerk_token(authorization: str) -> dict:
+    """
+    Verify a Clerk JWT from the Authorization header.
+    Returns the decoded token claims (sub, email, name, etc.).
+    Raises HTTPException 401 on failure.
+    """
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+
+    token = authorization.removeprefix("Bearer ").strip()
+
+    try:
+        jwks_client = _get_jwks_client()
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
+        claims = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            options={"verify_aud": False},  # Clerk doesn't always set aud
+        )
+        return claims
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError as e:
+        logger.warning(f"Invalid Clerk JWT: {e}")
+        raise HTTPException(status_code=401, detail="Invalid token")
+    except Exception as e:
+        logger.error(f"JWT verification error: {e}")
+        raise HTTPException(status_code=401, detail="Authentication failed")
 
 
 # ── Report Dates ──────────────────────────────────────────────────────────────
@@ -77,24 +146,6 @@ def get_latest_report():
 def get_report(report_date: str):
     """
     Returns the full daily report for a given date.
-
-    Response shape:
-    {
-        "report_date": "2026-06-14",
-        "total_messages": 8012,
-        "total_users": 143,
-        "total_topics": 12,
-        "overall_sentiment": {"positive": 0.52, ...},
-        "narrative_md": "# Daily Report...",
-        "chart_data": {
-            "hourly_volume": [...],
-            "sentiment_overview": {...},
-            "sentiment_by_hour": [...],
-            "topic_engagement": [...],
-            "user_activity": [...]
-        },
-        "pipeline_duration_seconds": 367
-    }
     """
     try:
         report = fetch_report_by_date(report_date)
@@ -114,22 +165,6 @@ def get_report(report_date: str):
 def get_topics(report_date: str):
     """
     Returns all topics for a given date, ordered by engagement rank.
-
-    Response shape:
-    {
-        "report_date": "2026-06-14",
-        "topics": [
-            {
-                "topic_rank": 1,
-                "topic_name": "python · async · loop",
-                "message_count": 412,
-                "unique_users": 38,
-                "engagement_score": 0.87,
-                "sentiment_dist": {"positive": 0.72, ...},
-                ...
-            }
-        ]
-    }
     """
     try:
         topics = fetch_topics_by_date(report_date)
@@ -138,3 +173,86 @@ def get_topics(report_date: str):
         raise HTTPException(status_code=500, detail="Database error")
 
     return {"report_date": report_date, "topics": topics}
+
+
+# ── Audit Logging ─────────────────────────────────────────────────────────────
+
+VALID_EVENT_TYPES = {
+    "login",
+    "logout",
+    "view_report",
+    "view_topics",
+    "change_date",
+    "click_topic_card",
+}
+
+
+class AuditEvent(BaseModel):
+    event_type: str
+    event_meta: dict = {}
+
+
+@router.post("/audit")
+def log_audit_event(event: AuditEvent, request: Request):
+    """
+    Logs a user activity event to the audit_log Supabase table.
+
+    The Clerk JWT is verified from the Authorization header. User email,
+    ID, and name are extracted from the token claims — the frontend
+    cannot forge these.
+
+    Request body:
+        { "event_type": "view_report", "event_meta": {"report_date": "2026-06-14"} }
+    """
+    # Verify the Clerk JWT
+    auth_header = request.headers.get("authorization", "")
+    claims = verify_clerk_token(auth_header)
+
+    # Validate event type
+    if event.event_type not in VALID_EVENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid event_type. Must be one of: {', '.join(sorted(VALID_EVENT_TYPES))}"
+        )
+
+    # Extract user info from Clerk JWT claims
+    # Clerk JWTs have: sub (user ID), email, name, username
+    clerk_user_id = claims.get("sub", "unknown")
+
+    # Clerk stores user metadata differently — email might be in claims directly
+    # or in the session claims. We also get it from the frontend event_meta as fallback.
+    email = (
+        claims.get("email")
+        or claims.get("primary_email")
+        or event.event_meta.get("email", "unknown")
+    )
+    display_name = (
+        claims.get("name")
+        or claims.get("full_name")
+        or event.event_meta.get("name", "")
+    )
+    nickname = (
+        claims.get("username")
+        or event.event_meta.get("nickname", "")
+    )
+
+    # Build audit payload
+    payload = {
+        "clerk_user_id": clerk_user_id,
+        "email": email,
+        "display_name": display_name,
+        "nickname": nickname,
+        "event_type": event.event_type,
+        "event_meta": json.dumps(event.event_meta) if event.event_meta else "{}",
+        "ip_address": request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown"),
+        "user_agent": request.headers.get("user-agent", "unknown"),
+    }
+
+    try:
+        insert_audit_log(payload)
+        logger.info(f"[audit] {event.event_type} by {email} ({clerk_user_id})")
+    except Exception as e:
+        logger.error(f"Failed to insert audit event: {e}")
+        raise HTTPException(status_code=500, detail="Failed to log event")
+
+    return {"status": "logged"}

@@ -104,7 +104,7 @@ app.add_middleware(
     # Tighten to your Netlify domain in production:
     # allow_origins=["https://your-app.netlify.app"]
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 

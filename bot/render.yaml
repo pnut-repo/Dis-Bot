@@ -22,6 +22,8 @@ services:
         sync: false
       - key: HF_SPACE_API_KEY
         sync: false
+      - key: CLERK_PUBLISHABLE_KEY
+        sync: false
       - key: PIPELINE_RUN_HOUR
         value: "0"
       - key: PIPELINE_RUN_MINUTE

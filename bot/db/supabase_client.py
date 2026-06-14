@@ -136,3 +136,17 @@ def insert_user_daily_stats(rows: list[dict]) -> None:
     unique key — safe to re-run for the same date.
     """
     get_client().table("user_daily_stats").upsert(rows, on_conflict="report_date,user_id").execute()
+
+
+# ── audit_log ─────────────────────────────────────────────────────────────────
+
+def insert_audit_log(payload: dict) -> None:
+    """
+    Insert a single audit event into the audit_log table.
+
+    Payload shape:
+        clerk_user_id, email, display_name, nickname, event_type,
+        event_meta (JSONB), ip_address, user_agent
+    """
+    get_client().table("audit_log").insert(payload).execute()
+
