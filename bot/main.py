@@ -113,7 +113,7 @@ app.include_router(router, prefix="/api")
 
 # ── Health check ─────────────────────────────────────────────────────────────
 
-@app.get("/health", tags=["infra"])
+@app.api_route("/health", methods=["GET", "HEAD"], tags=["infra"])
 def health():
     """
     UptimeRobot pings this endpoint every 5 minutes to keep Render awake.
