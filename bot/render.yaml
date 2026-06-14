@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: discord-sentiment-bot
+    env: python
+    rootDir: bot
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: DISCORD_CHANNEL_ID
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: HF_SPACE_URL
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: HF_SPACE_API_KEY
+        sync: false
+      - key: PIPELINE_RUN_HOUR
+        value: "0"
+      - key: PIPELINE_RUN_MINUTE
+        value: "5"
