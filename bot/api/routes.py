@@ -11,12 +11,14 @@ Endpoints:
     GET  /api/reports/{report_date}  → full report for a date
     GET  /api/topics/{report_date}   → topic rankings for a date
     POST /api/audit                  → log user activity event
+    POST /api/pipeline/run           → manually trigger the daily pipeline
 """
 
 import json
 import logging
 import os
 import hashlib
+import threading
 
 import jwt
 import requests
@@ -260,3 +262,30 @@ def log_audit_event(event: AuditEvent, request: Request):
         raise HTTPException(status_code=500, detail="Failed to log event")
 
     return {"status": "logged"}
+
+
+# ── Manual Pipeline Trigger ───────────────────────────────────────────────────
+
+@router.post("/pipeline/run")
+def trigger_pipeline(request: Request):
+    """
+    Manually trigger the daily pipeline. Protected by a shared secret
+    (PIPELINE_SECRET env var) to prevent unauthorized triggers.
+
+    Usage:
+        curl -X POST https://your-app.onrender.com/api/pipeline/run \
+             -H "X-Pipeline-Secret: your-secret-here"
+    """
+    expected = os.getenv("PIPELINE_SECRET", "")
+    provided = request.headers.get("x-pipeline-secret", "")
+
+    if not expected or provided != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    from pipeline.orchestrator import run_daily_pipeline
+
+    thread = threading.Thread(target=run_daily_pipeline, daemon=True)
+    thread.start()
+
+    logger.info("[manual] Pipeline triggered via /api/pipeline/run")
+    return {"status": "started", "message": "Pipeline is running in the background. Check logs for progress."}
