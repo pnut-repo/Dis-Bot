@@ -23,6 +23,7 @@ Error handling:
 """
 
 import os
+import re
 import json
 import time
 import logging
@@ -164,7 +165,15 @@ def _parse_response(raw: str) -> dict:
         text = text.rsplit("```", 1)[0]
     text = text.strip()
 
-    parsed = json.loads(text)
+    # Patch common LLM trailing comma JSON error (e.g., "score": 0.85, } )
+    text = re.sub(r',\s*([\]}])', r'\1', text)
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse LLM JSON output. Error: {e}")
+        logger.debug(f"Raw output was:\n{raw}")
+        raise ValueError(f"Invalid JSON: {e}")
 
     if "messages" not in parsed or "topics" not in parsed:
         raise ValueError(f"Missing 'messages' or 'topics' key in response")

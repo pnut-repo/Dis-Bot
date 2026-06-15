@@ -595,7 +595,10 @@ def compute_user_stats(
 
         r = result_by_id.get(m["message_id"])
         if r:
-            score = r.get("score", 0.5)
+            try:
+                score = float(r.get("score", 0.5))
+            except (ValueError, TypeError):
+                score = 0.5
             user_data[uid]["sentiment_scores"].append(score)
 
         topic_id = msg_topic_map.get(m["message_id"])
