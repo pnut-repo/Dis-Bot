@@ -7,9 +7,11 @@ Pipeline steps:
     0. Determine target date (yesterday UTC)
     1. Fetch messages from Supabase
     2. Wake up HuggingFace Space (handles cold starts up to 5 min)
-    3. Send all messages to HF Space → get sentiment labels + HDBSCAN topic labels
+    3. Send all messages to HF Space → full ML pipeline
+       (preprocess → context enrich → embed → UMAP → HDBSCAN →
+        outlier reassign → c-TF-IDF → sentiment aggregation)
     4. Write sentiment + topic labels back to Supabase messages table
-    5. Run TF-IDF topic naming + metadata assembly (on Render, no heavy ML)
+    5. Build topic metadata (participants, timing, engagement signals)
     6. Compute engagement scores + rank topics
     7. Compute per-user daily stats
     8. Build structured chart data JSON for the frontend
@@ -72,23 +74,34 @@ def run_daily_pipeline():
             logger.error("HF Space failed to wake up after 10 attempts. Aborting pipeline.")
             return
 
-        # ── Step 3: ML Analysis + Clustering (single HF Space request) ────────
-        logger.info("Step 3: Sending messages to HF Space for sentiment + HDBSCAN")
+        # ── Step 3: Full ML Analysis (single HF Space request) ────────────────
+        logger.info("Step 3: Sending messages to HF Space for full pipeline analysis")
 
         # Only send messages with text content — ML can't analyze empty messages.
         # We keep ALL messages for downstream volume/user stats.
         text_messages = [m for m in messages if m["content"].strip()]
 
-        sentiments, topic_labels = analyze_messages(text_messages)
-        # sentiments:   [{id, label, score}, ...] — same order as text_messages
-        # topic_labels: [int, ...]                — HDBSCAN labels (-1 = noise)
+        # Sort by timestamp for proper context enrichment on the HF Space
+        text_messages.sort(key=lambda m: m["created_at"])
+
+        # Send to HF Space — it handles everything:
+        # preprocessing → context enrichment → embeddings → UMAP →
+        # HDBSCAN → outlier reassignment → c-TF-IDF → sentiment aggregation
+        hf_result = analyze_messages(text_messages)
+
+        # Extract key results from HF Space response
+        per_msg_sentiment = hf_result.get("per_message_sentiment", [])
+        topic_labels      = hf_result.get("topic_labels", [-1] * len(text_messages))
+        hf_topics         = hf_result.get("topics", [])
 
         # O(1) lookup dict: message_id → {id, label, score}
-        sent_by_id = {s["id"]: s for s in sentiments}
+        sent_by_id = {s["id"]: s for s in per_msg_sentiment}
 
-        n_topics = len(set(l for l in topic_labels if l != -1))
+        n_topics = hf_result.get("n_topics", 0)
         logger.info(
-            f"HF Space complete: {len(sentiments)} sentiments, {n_topics} topics"
+            f"HF Space complete: {len(per_msg_sentiment)} sentiments, "
+            f"{n_topics} topics, {hf_result.get('uncategorized_count', 0)} uncategorized, "
+            f"{hf_result.get('processing_time_seconds', 0)}s"
         )
 
         # ── Step 4: Write sentiment + topic labels back to Supabase ───────────
@@ -105,14 +118,15 @@ def run_daily_pipeline():
         bulk_update_message_topics(updates)
         logger.info("Message topics + sentiments saved")
 
-        # ── Step 5: TF-IDF topic naming + metadata (Render, no heavy ML) ──────
-        logger.info("Step 5: Extracting topic metadata (TF-IDF keywords)")
+        # ── Step 5: Topic metadata (participants, timing, engagement signals) ──
+        logger.info("Step 5: Building topic metadata")
         topic_meta_list = extract_topic_metadata(
             messages=text_messages,
             topic_labels=topic_labels,
             sentiments=sent_by_id,
+            hf_topics=hf_topics,
         )
-        logger.info(f"Extracted metadata for {len(topic_meta_list)} topics")
+        logger.info(f"Built metadata for {len(topic_meta_list)} topics")
 
         # ── Step 6: Engagement scores + ranking ───────────────────────────────
         logger.info("Step 6: Computing engagement scores")
@@ -157,14 +171,18 @@ def run_daily_pipeline():
                 {
                     "rank":             t["topic_rank"],
                     "name":             t["topic_name"],
+                    "keywords":         t["topic_keywords"][:5],
                     "initiator":        t["initiator_username"],
                     "message_count":    t["message_count"],
                     "unique_users":     t["unique_users"],
                     "duration_minutes": round(t["duration_minutes"], 1),
                     "engagement_score": round(t["engagement_score"], 3),
                     "sentiment":        t["sentiment_dist"],
+                    "tension_score":    t.get("tension_score", 0),
+                    "needs_moderation": t.get("needs_moderation", False),
                     "peak_hour":        t["peak_hour"],
                     "top_participants": [p["username"] for p in t["top_participants"][:5]],
+                    "representative_messages": t.get("representative_messages", [])[:3],
                 }
                 for t in topic_meta_list[:15]
             ],
@@ -275,11 +293,14 @@ def build_chart_data(
     topic_engagement = [
         {
             "name":             t["topic_name"],
+            "keywords":         t["topic_keywords"][:5],
             "engagement_score": round(t["engagement_score"], 3),
             "message_count":    t["message_count"],
             "unique_users":     t["unique_users"],
             "duration_minutes": round(t["duration_minutes"], 1),
             "sentiment":        t["sentiment_dist"],
+            "tension_score":    t.get("tension_score", 0),
+            "needs_moderation": t.get("needs_moderation", False),
         }
         for t in topic_meta_list[:20]
     ]
@@ -430,6 +451,8 @@ def build_topic_rows(topic_meta_list: list[dict]) -> list[dict]:
             "peak_hour":          t["peak_hour"],
             "engagement_score":   t["engagement_score"],
             "sentiment_dist":     t["sentiment_dist"],
+            "tension_score":      t.get("tension_score", 0),
+            "needs_moderation":   t.get("needs_moderation", False),
             "top_participants":   t["top_participants"][:10],
             "first_message_at":   t["first_message_at"],
             "last_message_at":    t["last_message_at"],

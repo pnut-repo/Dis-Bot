@@ -5,7 +5,7 @@ Responsibilities:
     1. Wake up the HF Space before sending the main payload (it can sleep after
        48-72h of inactivity; cold start takes 2-4 minutes).
     2. Send all of a day's messages in ONE POST to /analyze.
-    3. Return (sentiments, topic_labels) to the orchestrator.
+    3. Return the full pipeline result (topics, sentiments, labels) to the orchestrator.
     4. Fall back gracefully (neutral sentiment, all-noise labels) if the Space
        fails — the daily pipeline should never crash the bot entirely.
 
@@ -59,7 +59,7 @@ def wake_up_space(max_retries: int = 10, delay: int = 30) -> bool:
                 data = r.json()
                 logger.info(
                     f"HF Space is awake (attempt {attempt}) — "
-                    f"models: {data.get('models', 'unknown')}"
+                    f"pipeline: {data.get('pipeline', 'unknown')}"
                 )
                 return True
             logger.warning(
@@ -83,54 +83,51 @@ def wake_up_space(max_retries: int = 10, delay: int = 30) -> bool:
     return False
 
 
-def analyze_messages(
-    messages: list[dict],
-    hdbscan_params: dict | None = None,
-) -> tuple[list[dict], list[int]]:
+def analyze_messages(messages: list[dict]) -> dict:
     """
     Sends ALL messages for a given day to the HF Space in a single POST request.
 
-    The HF Space handles internal batching for inference and runs HDBSCAN on
-    all embeddings. Embeddings are computed and clustered on the HF Space —
-    they are never sent back to Render (keeps response ~800 KB vs ~25 MB).
+    The HF Space runs the full pipeline:
+        Preprocessing → Context Enrichment → Embeddings → UMAP →
+        HDBSCAN → Outlier Reassignment → c-TF-IDF → Sentiment Aggregation
 
     Args:
-        messages:       List of Supabase message dicts (must have message_id,
-                        content, user_id, created_at).
-        hdbscan_params: Optional override for HDBSCAN hyperparameters.
+        messages: List of Supabase message dicts (must have message_id,
+                  content, user_id, created_at, and optionally
+                  referenced_message_id for reply chain enrichment).
 
     Returns:
-        sentiments:   [{id, label, score}, ...] in the same order as messages.
-        topic_labels: [int, ...] — HDBSCAN cluster labels (-1 = noise).
+        Full pipeline result dict with keys:
+            - topics:                 [{topic_id, keywords, sentiment, ...}]
+            - topic_labels:           [int, ...] per-message cluster labels
+            - per_message_sentiment:  [{id, label, score}, ...]
+            - n_topics:               int
+            - uncategorized_count:    int
+            - day_summary:            {tension_score, sentiment_distribution, ...}
+            - processing_time_seconds: float
+
+        On failure: returns a fallback dict with neutral sentiment and all-noise labels.
     """
     if not messages:
-        return [], []
-
-    if hdbscan_params is None:
-        hdbscan_params = {
-            "min_cluster_size": 8,
-            "min_samples": 3,
-            "cluster_selection_epsilon": 0.3,
-        }
+        return _fallback_result([])
 
     # Build the exact payload shape that HF Space /analyze expects
     payload = {
         "messages": [
             {
-                "id":        m["message_id"],
-                "content":   m["content"],
-                "user_id":   m["user_id"],
-                "timestamp": m["created_at"],
+                "id":           m["message_id"],
+                "content":      m["content"],
+                "user_id":      m["user_id"],
+                "timestamp":    m["created_at"],
+                "reference_id": m.get("referenced_message_id"),  # Reply chain for context enrichment
             }
             for m in messages
         ],
-        "hdbscan_params": hdbscan_params,
+        # Use defaults for UMAP/HDBSCAN params — can be overridden via env vars later
     }
 
     n = len(messages)
-    logger.info(
-        f"Sending {n} messages to HF Space for sentiment + embedding + HDBSCAN..."
-    )
+    logger.info(f"Sending {n} messages to HF Space for full pipeline analysis...")
 
     try:
         # 600s = 10 minutes. Generous timeout for 8k messages × ~5min processing.
@@ -145,14 +142,11 @@ def analyze_messages(
 
         logger.info(
             f"HF Space analysis complete — "
-            f"{data['n_topics']} topics, {data['n_noise']} noise, "
+            f"{data['n_topics']} topics, {data['uncategorized_count']} uncategorized, "
             f"{data['processing_time_seconds']}s"
         )
 
-        sentiments   = data["sentiments"]    # [{id, label, score}, ...] × n
-        topic_labels = data["topic_labels"]  # [int, ...] × n
-
-        return sentiments, topic_labels
+        return data
 
     except requests.exceptions.Timeout:
         logger.error(
@@ -164,11 +158,34 @@ def analyze_messages(
     except Exception as e:
         logger.error(f"HF Space request failed unexpectedly: {e}")
 
-    # Fallback: never crash the pipeline. Return neutral sentiment and all-noise
-    # topic labels so the rest of the orchestrator can still write a basic report.
-    fallback_sentiments = [
-        {"id": m["message_id"], "label": "neutral", "score": 0.5}
-        for m in messages
-    ]
-    fallback_labels = [-1] * n
-    return fallback_sentiments, fallback_labels
+    return _fallback_result(messages)
+
+
+def _fallback_result(messages: list[dict]) -> dict:
+    """
+    Build a fallback result when the HF Space is unreachable.
+    Returns neutral sentiment and all-noise topic labels so the
+    rest of the orchestrator can still write a basic report.
+    """
+    n = len(messages)
+    return {
+        "count": n,
+        "processing_time_seconds": 0,
+        "n_topics": 0,
+        "uncategorized_count": n,
+        "uncategorized_pct": 100.0,
+        "topics": [],
+        "topic_labels": [-1] * n,
+        "per_message_sentiment": [
+            {"id": m["message_id"], "label": "neutral", "score": 0.5}
+            for m in messages
+        ],
+        "day_summary": {
+            "total_topics": 0,
+            "dominant_topic_keywords": [],
+            "most_negative_topic_keywords": [],
+            "day_tension_score": 0.0,
+            "day_sentiment_distribution": {"positive": 0, "neutral": n, "negative": 0},
+            "overall_dominant_sentiment": "neutral",
+        },
+    }

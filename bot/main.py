@@ -103,7 +103,7 @@ app.add_middleware(
     CORSMiddleware,
     # Tighten to your Netlify domain in production:
     # allow_origins=["https://your-app.netlify.app"]
-    allow_origins=["https://pnut-analyser-webdashboard.netlify.app"],
+    allow_origins=["*"],
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
