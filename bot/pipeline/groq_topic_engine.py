@@ -37,9 +37,50 @@ logger = logging.getLogger(__name__)
 _client: Groq | None = None
 MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
-# Tune: ~1000 messages × ~20 tokens each = 20k input.  3k output.  2k prompt.
-MESSAGES_PER_BATCH = 1000
+# Token budget per Groq request: 30k TPM limit.
+# Reserve ~10k for system prompt (~800) + response tokens (~5k) + safety margin.
+TOKEN_BUDGET_PER_BATCH = 20_000
 WAIT_BETWEEN_BATCHES = 65  # seconds — ensures we stay under 30k TPM
+
+
+def _estimate_tokens(message: dict) -> int:
+    """
+    Estimate token count for a single message in the JSON payload.
+
+    Rough heuristic: 1 token ≈ 3.5 characters of text,
+    plus ~30 tokens of JSON overhead per entry (keys, id, username, time, etc.).
+    """
+    text = message.get("content", "")
+    # Truncation mirrors _build_batch_prompt (300 char cap)
+    text_len = min(len(text), 300)
+    return int(text_len / 3.5) + 30
+
+
+def _split_into_token_batches(text_messages: list[dict]) -> list[list[dict]]:
+    """
+    Pack messages into batches that fit within TOKEN_BUDGET_PER_BATCH.
+
+    Greedy packing: add messages to the current batch until the next one
+    would exceed the budget, then start a new batch.
+    """
+    batches = []
+    current_batch = []
+    current_tokens = 0
+
+    for msg in text_messages:
+        msg_tokens = _estimate_tokens(msg)
+        if current_batch and (current_tokens + msg_tokens) > TOKEN_BUDGET_PER_BATCH:
+            batches.append(current_batch)
+            current_batch = [msg]
+            current_tokens = msg_tokens
+        else:
+            current_batch.append(msg)
+            current_tokens += msg_tokens
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
 
 
 def _get_client() -> Groq:
@@ -244,15 +285,15 @@ def analyze_messages(messages: list[dict]) -> dict:
 
     logger.info(f"Groq topic engine: {n} total messages, {len(text_messages)} with text")
 
-    # ── Split into batches ────────────────────────────────────────────────────
-    batches = []
-    for i in range(0, len(text_messages), MESSAGES_PER_BATCH):
-        batches.append(text_messages[i : i + MESSAGES_PER_BATCH])
+    # ── Split into token-budget-aware batches ───────────────────────────────
+    batches = _split_into_token_batches(text_messages)
 
     total_batches = len(batches)
+    avg_batch = len(text_messages) // max(total_batches, 1)
     logger.info(
         f"Processing in {total_batches} batches "
-        f"({MESSAGES_PER_BATCH} msgs/batch, {WAIT_BETWEEN_BATCHES}s between)"
+        f"(~{avg_batch} msgs/batch avg, {WAIT_BETWEEN_BATCHES}s between, "
+        f"{TOKEN_BUDGET_PER_BATCH:,} token budget)"
     )
 
     # ── Process each batch ────────────────────────────────────────────────────
