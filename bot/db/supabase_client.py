@@ -73,9 +73,19 @@ def bulk_update_message_topics(updates: list[dict]) -> None:
         {"message_id": "...", "topic_id": 3, "sentiment_label": "positive", "sentiment_score": 0.91},
         ...
     ]
-    Uses upsert so it's safe to re-run.
+
+    Uses .update().eq() instead of upsert because the payload only contains
+    ML-output columns — an upsert would attempt an INSERT whose missing
+    NOT-NULL columns (user_id, etc.) cause a constraint violation.
     """
-    get_client().table("messages").upsert(updates, on_conflict="message_id").execute()
+    client = get_client()
+    for row in updates:
+        client.table("messages").update({
+            "topic_id":        row["topic_id"],
+            "sentiment_label": row["sentiment_label"],
+            "sentiment_score": row["sentiment_score"],
+        }).eq("message_id", row["message_id"]).execute()
+    logger.info(f"Updated {len(updates)} messages with topic + sentiment data")
 
 
 # ── daily_reports ─────────────────────────────────────────────────────────────
