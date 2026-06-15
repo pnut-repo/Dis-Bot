@@ -119,7 +119,7 @@ def analyze_messages(messages: list[dict]) -> dict:
                 "content":      m["content"],
                 "user_id":      m["user_id"],
                 "timestamp":    m["created_at"],
-                "reference_id": m.get("referenced_message_id"),  # Reply chain for context enrichment
+                "reference_id": m.get("reply_to_id"),  # Reply chain for context enrichment
             }
             for m in messages
         ],

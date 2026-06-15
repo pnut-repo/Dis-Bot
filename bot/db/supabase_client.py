@@ -56,7 +56,7 @@ def fetch_messages_for_date(date_str: str) -> list[dict]:
     result = (
         get_client()
         .table("messages")
-        .select("message_id, user_id, username, display_name, content, created_at, is_reply")
+        .select("message_id, user_id, username, display_name, content, created_at, is_reply, reply_to_id")
         .gte("created_at", f"{date_str}T00:00:00+00:00")
         .lte("created_at", f"{date_str}T23:59:59+00:00")
         .order("created_at")
