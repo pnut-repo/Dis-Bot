@@ -50,42 +50,71 @@ def insert_message(payload: dict) -> None:
 
 def fetch_messages_for_date(date_str: str) -> list[dict]:
     """
-    Return all messages for a given UTC date (YYYY-MM-DD), ordered by created_at.
-    Used by the midnight pipeline to fetch yesterday's messages.
+    Return ALL messages for a given UTC date (YYYY-MM-DD), ordered by created_at.
+
+    Supabase PostgREST has a default limit of 1000 rows per SELECT.
+    This function paginates through all pages using .range() to ensure
+    no messages are silently dropped on busy days (3000+ messages).
     """
-    result = (
-        get_client()
-        .table("messages")
-        .select("message_id, user_id, username, display_name, content, created_at, is_reply, reply_to_id")
-        .gte("created_at", f"{date_str}T00:00:00+00:00")
-        .lte("created_at", f"{date_str}T23:59:59+00:00")
-        .order("created_at")
-        .execute()
-    )
-    return result.data
+    client = get_client()
+    all_messages = []
+    page_size = 1000
+    offset = 0
+
+    while True:
+        result = (
+            client
+            .table("messages")
+            .select("message_id, user_id, username, display_name, content, created_at, is_reply, reply_to_id")
+            .gte("created_at", f"{date_str}T00:00:00+00:00")
+            .lte("created_at", f"{date_str}T23:59:59+00:00")
+            .order("created_at")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        page = result.data
+        all_messages.extend(page)
+
+        if len(page) < page_size:
+            break  # Last page — fewer rows than page_size means no more data
+
+        offset += page_size
+
+    pages = (offset // page_size) + 1
+    logger.info(f"Fetched {len(all_messages)} messages for {date_str} ({pages} pages)")
+    return all_messages
 
 
-def bulk_update_message_topics(updates: list[dict]) -> None:
+def bulk_update_message_topics(updates: list[dict], batch_size: int = 100) -> None:
     """
     Write topic_id, sentiment_label, sentiment_score back to messages after ML pipeline.
 
-    updates = [
-        {"message_id": "...", "topic_id": 3, "sentiment_label": "positive", "sentiment_score": 0.91},
-        ...
-    ]
+    Uses batched upsert: 100 messages per HTTP request instead of 1 per request.
+    Each upsert payload includes ALL original message columns plus the ML-output
+    columns, so NOT NULL constraints are satisfied.
 
-    Uses .update().eq() instead of upsert because the payload only contains
-    ML-output columns — an upsert would attempt an INSERT whose missing
-    NOT-NULL columns (user_id, etc.) cause a constraint violation.
+    Args:
+        updates: List of FULL message dicts (original Supabase row merged with
+                 ML output columns: topic_id, sentiment_label, sentiment_score).
+        batch_size: Number of rows per upsert request (default 100).
     """
+    if not updates:
+        return
+
     client = get_client()
-    for row in updates:
-        client.table("messages").update({
-            "topic_id":        row["topic_id"],
-            "sentiment_label": row["sentiment_label"],
-            "sentiment_score": row["sentiment_score"],
-        }).eq("message_id", row["message_id"]).execute()
-    logger.info(f"Updated {len(updates)} messages with topic + sentiment data")
+    n_batches = 0
+
+    for i in range(0, len(updates), batch_size):
+        batch = updates[i : i + batch_size]
+        client.table("messages").upsert(
+            batch, on_conflict="message_id"
+        ).execute()
+        n_batches += 1
+
+    logger.info(
+        f"Updated {len(updates)} messages in {n_batches} batches "
+        f"(batch_size={batch_size})"
+    )
 
 
 # ── daily_reports ─────────────────────────────────────────────────────────────

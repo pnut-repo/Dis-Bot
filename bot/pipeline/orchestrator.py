@@ -38,7 +38,7 @@ from db.supabase_client import (
 )
 from pipeline.hf_client import wake_up_space, analyze_messages
 from pipeline.topic_analyzer import extract_topic_metadata
-from pipeline.groq_reporter import generate_narrative_report
+from pipeline.groq_reporter import generate_narrative_report, generate_topic_insights
 
 logger = logging.getLogger(__name__)
 
@@ -109,8 +109,10 @@ def run_daily_pipeline():
         updates = []
         for i, msg in enumerate(text_messages):
             s = sent_by_id.get(msg["message_id"], {"label": "neutral", "score": 0.5})
+            # Build FULL row: original message data + ML-output columns merged.
+            # The batched upsert needs all NOT NULL columns to avoid constraint violations.
             updates.append({
-                "message_id":      msg["message_id"],
+                **msg,  # original Supabase row (message_id, user_id, username, etc.)
                 "topic_id":        int(topic_labels[i]),
                 "sentiment_label": s["label"],
                 "sentiment_score": s["score"],
@@ -145,7 +147,7 @@ def run_daily_pipeline():
         chart_data = build_chart_data(messages, topic_meta_list, sent_by_id)
         logger.info("Chart data ready")
 
-        # ── Step 9: Summary JSON for Groq ─────────────────────────────────────
+        # ── Step 9: Build summary JSON for Groq ─────────────────────────────
         logger.info("Step 9: Building Groq summary JSON")
         all_sentiments = [
             sent_by_id.get(m["message_id"], {"label": "neutral", "score": 0.5})
@@ -155,6 +157,18 @@ def run_daily_pipeline():
         overall_pos = sum(1 for s in all_sentiments if s["label"] == "positive") / n_sent
         overall_neg = sum(1 for s in all_sentiments if s["label"] == "negative") / n_sent
         overall_neu = 1.0 - overall_pos - overall_neg
+
+        # ── Step 9.5: Per-topic Groq insights ─────────────────────────────────
+        logger.info("Step 9.5: Generating per-topic Groq insights")
+        topic_insights = generate_topic_insights(
+            topic_meta_list=topic_meta_list,
+            messages=text_messages,
+            topic_labels=topic_labels,
+        )
+        # Attach insights to topic metadata for downstream use
+        for tmeta in topic_meta_list:
+            tmeta["groq_insight"] = topic_insights.get(tmeta["topic_id"], "")
+        logger.info(f"Groq insights: {len(topic_insights)} topics received insights")
 
         summary_json = {
             "date":           target_date,
@@ -183,6 +197,7 @@ def run_daily_pipeline():
                     "peak_hour":        t["peak_hour"],
                     "top_participants": [p["username"] for p in t["top_participants"][:5]],
                     "representative_messages": t.get("representative_messages", [])[:3],
+                    "groq_insight":     t.get("groq_insight", ""),
                 }
                 for t in topic_meta_list[:15]
             ],
@@ -456,6 +471,7 @@ def build_topic_rows(topic_meta_list: list[dict]) -> list[dict]:
             "top_participants":   t["top_participants"][:10],
             "first_message_at":   t["first_message_at"],
             "last_message_at":    t["last_message_at"],
+            "groq_insight":       t.get("groq_insight", ""),
         }
         for t in topic_meta_list
     ]
