@@ -130,11 +130,12 @@ def analyze_messages(messages: list[dict]) -> dict:
     logger.info(f"Sending {n} messages to HF Space for full pipeline analysis...")
 
     try:
-        # 600s = 10 minutes. Generous timeout for 8k messages × ~5min processing.
+        # 1200s = 20 minutes. At 12k messages: sentiment ~2min, embed ~2min,
+        # UMAP ~5-8min, HDBSCAN ~1min, c-TF-IDF ~10s = ~15min worst case.
         resp = requests.post(
             f"{HF_SPACE_URL}/analyze",
             json=payload,
-            timeout=600,
+            timeout=1200,
             headers=_auth_headers(),
         )
         resp.raise_for_status()
@@ -150,7 +151,7 @@ def analyze_messages(messages: list[dict]) -> dict:
 
     except requests.exceptions.Timeout:
         logger.error(
-            f"HF Space request timed out after 600s for {n} messages. "
+            f"HF Space request timed out after 1200s for {n} messages. "
             f"Returning fallback neutral/noise labels."
         )
     except requests.exceptions.HTTPError as e:
