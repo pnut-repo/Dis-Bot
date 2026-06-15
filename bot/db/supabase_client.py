@@ -127,8 +127,19 @@ def fetch_report_by_date(date_str: str) -> dict | None:
 # ── topic_stats ───────────────────────────────────────────────────────────────
 
 def insert_topic_stats(rows: list[dict]) -> None:
-    """Insert all topic rows for a given report_date."""
-    get_client().table("topic_stats").insert(rows).execute()
+    """
+    Replace all topic rows for a given report_date.
+    Deletes any existing rows for the date before inserting fresh ones,
+    so re-triggering the pipeline never creates duplicate topic entries.
+    """
+    if not rows:
+        return
+    report_date = rows[0]["report_date"]
+    client = get_client()
+    # Delete previous rows for this date (idempotent — safe if none exist)
+    client.table("topic_stats").delete().eq("report_date", report_date).execute()
+    client.table("topic_stats").insert(rows).execute()
+    logger.info(f"Replaced topic_stats for {report_date} ({len(rows)} topics)")
 
 
 def fetch_topics_by_date(date_str: str) -> list[dict]:
