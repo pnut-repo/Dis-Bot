@@ -195,10 +195,16 @@ def run_daily_pipeline():
         })
 
         topic_rows = build_topic_rows(topic_meta_list)
-        insert_topic_stats(topic_rows)
+        if topic_rows:
+            insert_topic_stats(topic_rows)
+        else:
+            logger.warning("No topic rows to insert (all noise).")
 
         user_daily_rows = [{**u, "report_date": target_date} for u in user_stats]
-        insert_user_daily_stats(user_daily_rows)
+        if user_daily_rows:
+            insert_user_daily_stats(user_daily_rows)
+        else:
+            logger.warning("No user daily stats to insert.")
 
         # The 14-day purge is handled by pg_cron — no delete call needed here.
 
