@@ -10,6 +10,8 @@ Endpoints:
     GET  /api/reports/latest         → most recent report
     GET  /api/reports/{report_date}  → full report for a date
     GET  /api/topics/{report_date}   → topic rankings for a date
+    GET  /api/users/{report_date}    → all users' stats for a date
+    GET  /api/analytics/{report_date}→ expanded analytics for a date
     POST /api/audit                  → log user activity event
     POST /api/pipeline/run           → manually trigger the daily pipeline
 """
@@ -29,6 +31,8 @@ from db.supabase_client import (
     fetch_available_report_dates,
     fetch_report_by_date,
     fetch_topics_by_date,
+    fetch_user_stats_by_date,
+    fetch_analytics_by_date,
     insert_audit_log,
 )
 
@@ -176,6 +180,44 @@ def get_topics(report_date: str):
         raise HTTPException(status_code=500, detail="Database error")
 
     return {"report_date": report_date, "topics": topics}
+
+
+# ── User Stats ────────────────────────────────────────────────────────────────
+
+@router.get("/users/{report_date}")
+def get_user_stats(report_date: str):
+    """
+    Returns all users' daily stats for a given date.
+    Used by the user dropdown in the dashboard analytics tab.
+    """
+    try:
+        users = fetch_user_stats_by_date(report_date)
+    except Exception as e:
+        logger.error(f"Failed to fetch user stats for {report_date}: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+
+    return {"report_date": report_date, "users": users}
+
+
+# ── Analytics ─────────────────────────────────────────────────────────────────
+
+@router.get("/analytics/{report_date}")
+def get_analytics(report_date: str):
+    """
+    Returns expanded analytics data for a given date.
+    Includes per-user hourly activity, sentiment breakdowns, and topic details.
+    Retained for 30 days (even after messages are purged at 3 days).
+    """
+    try:
+        analytics = fetch_analytics_by_date(report_date)
+    except Exception as e:
+        logger.error(f"Failed to fetch analytics for {report_date}: {e}")
+        raise HTTPException(status_code=500, detail="Database error")
+
+    if not analytics:
+        raise HTTPException(status_code=404, detail=f"No analytics for {report_date}")
+
+    return analytics
 
 
 # ── Audit Logging ─────────────────────────────────────────────────────────────

@@ -16,11 +16,9 @@ services:
         sync: false
       - key: SUPABASE_SERVICE_KEY
         sync: false
-      - key: HF_SPACE_URL
+      - key: GROQ_API_KEY_SCOUT
         sync: false
-      - key: GROQ_API_KEY
-        sync: false
-      - key: HF_SPACE_API_KEY
+      - key: GROQ_API_KEY_VERSATILE
         sync: false
       - key: CLERK_PUBLISHABLE_KEY
         sync: false

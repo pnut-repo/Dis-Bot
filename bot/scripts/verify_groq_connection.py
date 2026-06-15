@@ -11,9 +11,13 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY or GROQ_API_KEY == "gsk_placeholder":
-    print("❌  GROQ_API_KEY is missing or still a placeholder in .env")
+GROQ_API_KEY_SCOUT = os.getenv("GROQ_API_KEY_SCOUT")
+GROQ_API_KEY_VERSATILE = os.getenv("GROQ_API_KEY_VERSATILE")
+if not GROQ_API_KEY_SCOUT or GROQ_API_KEY_SCOUT == "gsk_placeholder":
+    print("❌  GROQ_API_KEY_SCOUT is missing or still a placeholder in .env")
+    sys.exit(1)
+if not GROQ_API_KEY_VERSATILE or GROQ_API_KEY_VERSATILE == "gsk_placeholder":
+    print("❌  GROQ_API_KEY_VERSATILE is missing or still a placeholder in .env")
     sys.exit(1)
 
 # Minimal summary JSON — same shape as orchestrator Step 9
@@ -56,7 +60,7 @@ print("═" * 60)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from pipeline.groq_reporter import generate_narrative_report
 
-print(f"\n  Model : meta-llama/llama-4-scout-17b-16e-instruct")
+print(f"\n  Model : llama-3.3-70b-versatile (reporter)")
 print(f"  Input : {len(json.dumps(sample_summary))} chars of summary JSON")
 print(f"\n  Calling Groq API...\n")
 

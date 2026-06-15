@@ -1,7 +1,14 @@
 """
 db/supabase_client.py — Supabase database helper layer.
 
-Provides typed insert/fetch functions for all 4 tables.
+Provides typed insert/fetch functions for all tables:
+  - messages          (3-day retention)
+  - daily_reports     (30-day retention)
+  - topic_stats       (30-day retention)
+  - user_daily_stats  (30-day retention)
+  - daily_analytics   (30-day retention — expanded chart data for frontend)
+  - audit_log         (indefinite)
+
 Uses a singleton client to avoid re-creating connections on every call.
 The service role key bypasses Row Level Security (RLS) — only used on Render, never frontend.
 """
@@ -34,14 +41,7 @@ def get_client() -> Client:
 def insert_message(payload: dict) -> None:
     """
     Insert a single Discord message into the messages table.
-
-    Uses upsert with ignore_duplicates so that if the bot restarts and
-    Discord replays recent messages, duplicates are silently skipped
-    instead of raising a 23505 unique-constraint error.
-
-    Payload shape (mirrors Supabase messages schema):
-        message_id, user_id, username, display_name, content,
-        created_at, has_attachment, is_reply, reply_to_id
+    Uses upsert with ignore_duplicates so duplicates are silently skipped.
     """
     get_client().table("messages").upsert(
         payload, on_conflict="message_id", ignore_duplicates=True
@@ -51,10 +51,7 @@ def insert_message(payload: dict) -> None:
 def fetch_messages_for_date(date_str: str) -> list[dict]:
     """
     Return ALL messages for a given UTC date (YYYY-MM-DD), ordered by created_at.
-
-    Supabase PostgREST has a default limit of 1000 rows per SELECT.
-    This function paginates through all pages using .range() to ensure
-    no messages are silently dropped on busy days (3000+ messages).
+    Paginates through all pages using .range() (PostgREST default limit = 1000).
     """
     client = get_client()
     all_messages = []
@@ -76,7 +73,7 @@ def fetch_messages_for_date(date_str: str) -> list[dict]:
         all_messages.extend(page)
 
         if len(page) < page_size:
-            break  # Last page — fewer rows than page_size means no more data
+            break
 
         offset += page_size
 
@@ -87,16 +84,8 @@ def fetch_messages_for_date(date_str: str) -> list[dict]:
 
 def bulk_update_message_topics(updates: list[dict], batch_size: int = 100) -> None:
     """
-    Write topic_id, sentiment_label, sentiment_score back to messages after ML pipeline.
-
-    Uses batched upsert: 100 messages per HTTP request instead of 1 per request.
-    Each upsert payload includes ALL original message columns plus the ML-output
-    columns, so NOT NULL constraints are satisfied.
-
-    Args:
-        updates: List of FULL message dicts (original Supabase row merged with
-                 ML output columns: topic_id, sentiment_label, sentiment_score).
-        batch_size: Number of rows per upsert request (default 100).
+    Write topic_id, sentiment_label, sentiment_score back to messages.
+    Uses batched upsert: 100 messages per HTTP request.
     """
     if not updates:
         return
@@ -120,21 +109,18 @@ def bulk_update_message_topics(updates: list[dict], batch_size: int = 100) -> No
 # ── daily_reports ─────────────────────────────────────────────────────────────
 
 def upsert_daily_report(payload: dict) -> None:
-    """
-    Write (or overwrite) the daily report for a given date.
-    ON CONFLICT report_date ensures the pipeline is idempotent.
-    """
+    """Write (or overwrite) the daily report for a given date."""
     get_client().table("daily_reports").upsert(payload, on_conflict="report_date").execute()
 
 
 def fetch_available_report_dates() -> list[str]:
-    """Return the 14 most recent dates that have reports, newest first."""
+    """Return the 30 most recent dates that have reports, newest first."""
     result = (
         get_client()
         .table("daily_reports")
         .select("report_date")
         .order("report_date", desc=True)
-        .limit(14)
+        .limit(30)
         .execute()
     )
     return [r["report_date"] for r in result.data]
@@ -158,14 +144,12 @@ def fetch_report_by_date(date_str: str) -> dict | None:
 def insert_topic_stats(rows: list[dict]) -> None:
     """
     Replace all topic rows for a given report_date.
-    Deletes any existing rows for the date before inserting fresh ones,
-    so re-triggering the pipeline never creates duplicate topic entries.
+    Deletes existing rows before inserting fresh ones (idempotent).
     """
     if not rows:
         return
     report_date = rows[0]["report_date"]
     client = get_client()
-    # Delete previous rows for this date (idempotent — safe if none exist)
     client.table("topic_stats").delete().eq("report_date", report_date).execute()
     client.table("topic_stats").insert(rows).execute()
     logger.info(f"Replaced topic_stats for {report_date} ({len(rows)} topics)")
@@ -187,22 +171,49 @@ def fetch_topics_by_date(date_str: str) -> list[dict]:
 # ── user_daily_stats ──────────────────────────────────────────────────────────
 
 def insert_user_daily_stats(rows: list[dict]) -> None:
-    """
-    Upsert per-user daily stats. ON CONFLICT (report_date, user_id) is the
-    unique key — safe to re-run for the same date.
-    """
+    """Upsert per-user daily stats. ON CONFLICT (report_date, user_id)."""
     get_client().table("user_daily_stats").upsert(rows, on_conflict="report_date,user_id").execute()
+
+
+def fetch_user_stats_by_date(date_str: str) -> list[dict]:
+    """Return all user stats for a date, ordered by message_count descending."""
+    return (
+        get_client()
+        .table("user_daily_stats")
+        .select("*")
+        .eq("report_date", date_str)
+        .order("message_count", desc=True)
+        .execute()
+        .data
+    )
+
+
+# ── daily_analytics (NEW — 30-day retention) ─────────────────────────────────
+
+def upsert_daily_analytics(payload: dict) -> None:
+    """
+    Write (or overwrite) the daily analytics for a given date.
+    This table stores expanded chart data including per-user analytics
+    for the user dropdown feature. Retained for 30 days.
+    """
+    get_client().table("daily_analytics").upsert(payload, on_conflict="report_date").execute()
+
+
+def fetch_analytics_by_date(date_str: str) -> dict | None:
+    """Return the daily_analytics row for a given date, or None."""
+    result = (
+        get_client()
+        .table("daily_analytics")
+        .select("*")
+        .eq("report_date", date_str)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
 
 
 # ── audit_log ─────────────────────────────────────────────────────────────────
 
 def insert_audit_log(payload: dict) -> None:
-    """
-    Insert a single audit event into the audit_log table.
-
-    Payload shape:
-        clerk_user_id, email, display_name, nickname, event_type,
-        event_meta (JSONB), ip_address, user_agent
-    """
+    """Insert a single audit event into the audit_log table."""
     get_client().table("audit_log").insert(payload).execute()
-

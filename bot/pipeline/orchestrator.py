@@ -1,31 +1,33 @@
 """
-pipeline/orchestrator.py — Midnight Pipeline Orchestrator
-==========================================================
+pipeline/orchestrator.py — Midnight Pipeline Orchestrator (Groq-Only v3)
+==========================================================================
 The central brain of the system. Scheduled at 00:05 UTC every day via APScheduler.
+
+Architecture: Two-stage Groq LLM pipeline (no HuggingFace Space).
 
 Pipeline steps:
     0. Determine target date (yesterday UTC)
-    1. Fetch messages from Supabase
-    2. Wake up HuggingFace Space (handles cold starts up to 5 min)
-    3. Send all messages to HF Space → full ML pipeline
-       (preprocess → context enrich → embed → UMAP → HDBSCAN →
-        outlier reassign → c-TF-IDF → sentiment aggregation)
-    4. Write sentiment + topic labels back to Supabase messages table
-    5. Build topic metadata (participants, timing, engagement signals)
-    6. Compute engagement scores + rank topics
-    7. Compute per-user daily stats
-    8. Build structured chart data JSON for the frontend
-    9. Build summary JSON for Groq
-    10. Generate Groq narrative report
-    11. Write daily_report, topic_stats, user_daily_stats to Supabase
-
-The 14-day message purge is NOT here — it runs via pg_cron at 00:05 UTC (skill-02).
+    1. Fetch ALL messages from Supabase (paginated, full day 00:00–23:59)
+    2. Groq API 1 (llama-4-scout): Batch topic analysis + sentiment
+       - Processes ~1000 messages per batch
+       - Maintains topic consistency across batches
+       - 65s delay between batches for rate limit
+    3. Write sentiment + topic labels back to Supabase messages table
+    4. Build topic metadata from LLM results
+    5. Compute engagement scores + rank topics
+    6. Compute per-user daily stats
+    7. Build chart data JSON for frontend (including per-user analytics)
+    8. Build summary JSON for Groq API 2
+    9. Groq API 2 (llama-3.3-70b): Generate narrative report
+   10. Write daily_report, topic_stats, user_daily_stats, daily_analytics to Supabase
 """
 
 import logging
 import traceback
 import time
-from datetime import date, timedelta
+from collections import Counter, defaultdict
+from datetime import date, datetime, timedelta
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -35,10 +37,10 @@ from db.supabase_client import (
     upsert_daily_report,
     insert_topic_stats,
     insert_user_daily_stats,
+    upsert_daily_analytics,
 )
-from pipeline.hf_client import wake_up_space, analyze_messages
-from pipeline.topic_analyzer import extract_topic_metadata
-from pipeline.groq_reporter import generate_narrative_report, generate_topic_insights
+from pipeline.groq_topic_engine import analyze_messages
+from pipeline.groq_reporter import generate_narrative_report
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +48,7 @@ logger = logging.getLogger(__name__)
 def run_daily_pipeline():
     """
     Full midnight pipeline. Called by APScheduler at 00:05 UTC.
-    Analyzes the previous UTC day's messages.
+    Analyzes the previous UTC day's messages using two Groq LLM APIs.
     """
     pipeline_start = time.time()
 
@@ -68,151 +70,78 @@ def run_daily_pipeline():
 
         logger.info(f"Fetched {len(messages)} messages")
 
-        # ── Step 2: Wake up HF Space ───────────────────────────────────────────
-        logger.info("Step 2: Waking up HuggingFace Space")
-        if not wake_up_space():   # 10 retries × 30s = 5 min budget
-            logger.error("HF Space failed to wake up after 10 attempts. Aborting pipeline.")
-            return
+        # ── Step 2: Groq API 1 — Topic & Sentiment Analysis ──────────────────
+        logger.info("Step 2: Groq API 1 — Batch topic & sentiment analysis")
+        groq_result = analyze_messages(messages)
 
-        # ── Step 3: Full ML Analysis (single HF Space request) ────────────────
-        logger.info("Step 3: Sending messages to HF Space for full pipeline analysis")
+        msg_results = groq_result.get("messages", [])
+        llm_topics = groq_result.get("topics", [])
 
-        # Only send messages with text content — ML can't analyze empty messages.
-        # We keep ALL messages for downstream volume/user stats.
-        text_messages = [m for m in messages if m["content"].strip()]
+        # O(1) lookup: message_id → {topic_id, sentiment, score}
+        result_by_id = {m["id"]: m for m in msg_results}
 
-        # Sort by timestamp for proper context enrichment on the HF Space
-        text_messages.sort(key=lambda m: m["created_at"])
-
-        # Send to HF Space — it handles everything:
-        # preprocessing → context enrichment → embeddings → UMAP →
-        # HDBSCAN → outlier reassignment → c-TF-IDF → sentiment aggregation
-        hf_result = analyze_messages(text_messages)
-
-        # Extract key results from HF Space response
-        per_msg_sentiment = hf_result.get("per_message_sentiment", [])
-        topic_labels      = hf_result.get("topic_labels", [-1] * len(text_messages))
-        hf_topics         = hf_result.get("topics", [])
-
-        # O(1) lookup dict: message_id → {id, label, score}
-        sent_by_id = {s["id"]: s for s in per_msg_sentiment}
-
-        n_topics = hf_result.get("n_topics", 0)
+        n_topics = groq_result.get("n_topics", 0)
         logger.info(
-            f"HF Space complete: {len(per_msg_sentiment)} sentiments, "
-            f"{n_topics} topics, {hf_result.get('uncategorized_count', 0)} uncategorized, "
-            f"{hf_result.get('processing_time_seconds', 0)}s"
+            f"Groq API 1 complete: {len(msg_results)} messages analyzed, "
+            f"{n_topics} topics, {groq_result.get('uncategorized_count', 0)} uncategorized, "
+            f"{groq_result.get('processing_time_seconds', 0)}s"
         )
 
-        # ── Step 4: Write sentiment + topic labels back to Supabase ───────────
-        logger.info("Step 4: Updating message topics + sentiments in Supabase")
+        # ── Step 3: Write sentiment + topic labels back to Supabase ───────────
+        logger.info("Step 3: Updating message topics + sentiments in Supabase")
         updates = []
-        for i, msg in enumerate(text_messages):
-            s = sent_by_id.get(msg["message_id"], {"label": "neutral", "score": 0.5})
-            # Build FULL row: original message data + ML-output columns merged.
-            # The batched upsert needs all NOT NULL columns to avoid constraint violations.
+        for msg in messages:
+            r = result_by_id.get(msg["message_id"], {
+                "topic_id": -1, "sentiment": "neutral", "score": 0.5,
+            })
             updates.append({
-                **msg,  # original Supabase row (message_id, user_id, username, etc.)
-                "topic_id":        int(topic_labels[i]),
-                "sentiment_label": s["label"],
-                "sentiment_score": s["score"],
+                **msg,  # original Supabase row
+                "topic_id":        int(r.get("topic_id", -1)),
+                "sentiment_label": r.get("sentiment", "neutral"),
+                "sentiment_score": float(r.get("score", 0.5)),
             })
         bulk_update_message_topics(updates)
         logger.info("Message topics + sentiments saved")
 
-        # ── Step 5: Topic metadata (participants, timing, engagement signals) ──
-        logger.info("Step 5: Building topic metadata")
-        topic_meta_list = extract_topic_metadata(
-            messages=text_messages,
-            topic_labels=topic_labels,
-            sentiments=sent_by_id,
-            hf_topics=hf_topics,
+        # ── Step 4: Build topic metadata from LLM results ─────────────────────
+        logger.info("Step 4: Building topic metadata")
+        topic_meta_list = _build_topic_metadata(
+            messages=messages,
+            result_by_id=result_by_id,
+            llm_topics=llm_topics,
         )
         logger.info(f"Built metadata for {len(topic_meta_list)} topics")
 
-        # ── Step 6: Engagement scores + ranking ───────────────────────────────
-        logger.info("Step 6: Computing engagement scores")
+        # ── Step 5: Engagement scores + ranking ───────────────────────────────
+        logger.info("Step 5: Computing engagement scores")
         topic_meta_list = compute_engagement_scores(topic_meta_list)
         topic_meta_list.sort(key=lambda t: t["engagement_score"], reverse=True)
         for rank, topic in enumerate(topic_meta_list, start=1):
-            topic["topic_rank"]  = rank
+            topic["topic_rank"] = rank
             topic["report_date"] = target_date
 
-        # ── Step 7: Per-user daily stats ──────────────────────────────────────
-        logger.info("Step 7: Computing user daily stats")
-        user_stats = compute_user_stats(messages, topic_meta_list, sent_by_id)
+        # ── Step 6: Per-user daily stats ──────────────────────────────────────
+        logger.info("Step 6: Computing user daily stats")
+        user_stats = compute_user_stats(messages, topic_meta_list, result_by_id)
 
-        # ── Step 8: Chart data JSON for frontend ──────────────────────────────
-        logger.info("Step 8: Building chart data JSON for frontend")
-        chart_data = build_chart_data(messages, topic_meta_list, sent_by_id)
+        # ── Step 7: Chart data JSON for frontend ──────────────────────────────
+        logger.info("Step 7: Building chart data JSON for frontend")
+        chart_data = build_chart_data(messages, topic_meta_list, result_by_id)
         logger.info("Chart data ready")
 
-        # ── Step 9: Build summary JSON for Groq ─────────────────────────────
-        logger.info("Step 9: Building Groq summary JSON")
-        all_sentiments = [
-            sent_by_id.get(m["message_id"], {"label": "neutral", "score": 0.5})
-            for m in text_messages
-        ]
-        n_sent = len(all_sentiments) or 1
-        overall_pos = sum(1 for s in all_sentiments if s["label"] == "positive") / n_sent
-        overall_neg = sum(1 for s in all_sentiments if s["label"] == "negative") / n_sent
-        overall_neu = 1.0 - overall_pos - overall_neg
-
-        # ── Step 9.5: Per-topic Groq insights ─────────────────────────────────
-        logger.info("Step 9.5: Generating per-topic Groq insights")
-        topic_insights = generate_topic_insights(
-            topic_meta_list=topic_meta_list,
-            messages=text_messages,
-            topic_labels=topic_labels,
+        # ── Step 8: Build summary JSON for Groq API 2 ────────────────────────
+        logger.info("Step 8: Building Groq summary JSON")
+        summary_json = _build_summary_json(
+            target_date, messages, topic_meta_list, user_stats, result_by_id
         )
-        # Attach insights to topic metadata for downstream use
-        for tmeta in topic_meta_list:
-            tmeta["groq_insight"] = topic_insights.get(tmeta["topic_id"], "")
-        logger.info(f"Groq insights: {len(topic_insights)} topics received insights")
 
-        summary_json = {
-            "date":           target_date,
-            "total_messages": len(messages),
-            "text_messages":  len(text_messages),
-            "total_users":    len(set(m["user_id"] for m in messages)),
-            "total_topics":   len(topic_meta_list),
-            "overall_sentiment": {
-                "positive": round(overall_pos, 3),
-                "neutral":  round(overall_neu, 3),
-                "negative": round(overall_neg, 3),
-            },
-            "top_topics": [
-                {
-                    "rank":             t["topic_rank"],
-                    "name":             t["topic_name"],
-                    "keywords":         t["topic_keywords"][:5],
-                    "initiator":        t["initiator_username"],
-                    "message_count":    t["message_count"],
-                    "unique_users":     t["unique_users"],
-                    "duration_minutes": round(t["duration_minutes"], 1),
-                    "engagement_score": round(t["engagement_score"], 3),
-                    "sentiment":        t["sentiment_dist"],
-                    "tension_score":    t.get("tension_score", 0),
-                    "needs_moderation": t.get("needs_moderation", False),
-                    "peak_hour":        t["peak_hour"],
-                    "top_participants": [p["username"] for p in t["top_participants"][:5]],
-                    "representative_messages": t.get("representative_messages", [])[:3],
-                    "groq_insight":     t.get("groq_insight", ""),
-                }
-                for t in topic_meta_list[:15]
-            ],
-            "most_active_users": sorted(
-                user_stats, key=lambda u: u["message_count"], reverse=True
-            )[:10],
-        }
-
-        # ── Step 10: Groq narrative report ─────────────────────────────────────
-        logger.info("Step 10: Generating Groq narrative report")
+        # ── Step 9: Groq API 2 — Narrative Report ─────────────────────────────
+        logger.info("Step 9: Generating narrative report (llama-3.3-70b)")
         narrative_md = generate_narrative_report(summary_json)
         logger.info("Groq report generated")
 
-        # ── Step 11: Write to Supabase ─────────────────────────────────────────
-        logger.info("Step 11: Writing results to Supabase")
+        # ── Step 10: Write to Supabase ─────────────────────────────────────────
+        logger.info("Step 10: Writing results to Supabase")
         pipeline_duration = int(time.time() - pipeline_start)
 
         upsert_daily_report({
@@ -239,7 +168,20 @@ def run_daily_pipeline():
         else:
             logger.warning("No user daily stats to insert.")
 
-        # The 14-day purge is handled by pg_cron — no delete call needed here.
+        # Write expanded analytics data (30-day retention)
+        upsert_daily_analytics({
+            "report_date": target_date,
+            "hourly_data": chart_data.get("hourly_volume", []),
+            "sentiment_hourly": chart_data.get("sentiment_by_hour", []),
+            "user_analytics": chart_data.get("user_detail", {}),
+            "topic_analytics": chart_data.get("topic_engagement", []),
+            "summary_stats": {
+                "total_messages": len(messages),
+                "total_users": summary_json["total_users"],
+                "total_topics": len(topic_meta_list),
+                "overall_sentiment": summary_json["overall_sentiment"],
+            },
+        })
 
         logger.info(f"═══ Pipeline complete for {target_date} in {pipeline_duration}s ═══")
 
@@ -248,21 +190,181 @@ def run_daily_pipeline():
         logger.error(traceback.format_exc())
 
 
+# ── Topic Metadata Builder ────────────────────────────────────────────────────
+
+def _build_topic_metadata(
+    messages: list[dict],
+    result_by_id: dict,
+    llm_topics: list[dict],
+) -> list[dict]:
+    """
+    Build topic metadata by combining LLM topic analysis with raw message data.
+
+    The LLM provides: topic names, keywords, insights
+    This function adds: message counts, participants, timing, sentiment distribution
+    """
+    # Group messages by topic_id
+    topic_msgs: dict[int, list[dict]] = defaultdict(list)
+    for msg in messages:
+        r = result_by_id.get(msg["message_id"], {})
+        tid = r.get("topic_id", -1)
+        if tid >= 0:
+            topic_msgs[tid].append(msg)
+
+    # Build LLM topic lookup
+    llm_topic_map = {t["topic_id"]: t for t in llm_topics if t.get("topic_id", -1) >= 0}
+
+    topics = []
+    for tid, msgs in topic_msgs.items():
+        if not msgs:
+            continue
+
+        llm_info = llm_topic_map.get(tid, {})
+        msgs.sort(key=lambda m: m["created_at"])
+
+        # Participants
+        user_counter = Counter(m["username"] for m in msgs)
+        top_participants = [
+            {"username": u, "message_count": c}
+            for u, c in user_counter.most_common(10)
+        ]
+
+        # Timing
+        first_ts = msgs[0]["created_at"]
+        last_ts = msgs[-1]["created_at"]
+        try:
+            first_dt = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+            last_dt = datetime.fromisoformat(last_ts.replace("Z", "+00:00"))
+            duration = (last_dt - first_dt).total_seconds() / 60
+        except (ValueError, TypeError):
+            duration = 0
+
+        # Peak hour
+        hours = []
+        for m in msgs:
+            try:
+                hours.append(datetime.fromisoformat(m["created_at"].replace("Z", "+00:00")).hour)
+            except (ValueError, TypeError):
+                pass
+        peak_hour = Counter(hours).most_common(1)[0][0] if hours else 0
+
+        # Sentiment distribution
+        sentiments = [
+            result_by_id.get(m["message_id"], {}).get("sentiment", "neutral")
+            for m in msgs
+        ]
+        sent_counter = Counter(sentiments)
+        n_sent = len(sentiments) or 1
+        pos_frac = sent_counter.get("positive", 0) / n_sent
+        neg_frac = sent_counter.get("negative", 0) / n_sent
+        neu_frac = sent_counter.get("neutral", 0) / n_sent
+
+        # Tension score
+        tension = neg_frac + 0.3 * neu_frac
+
+        # Reply density
+        reply_count = sum(1 for m in msgs if m.get("is_reply") or m.get("reply_to_id"))
+        reply_density = reply_count / len(msgs)
+
+        # Initiator (first message in topic)
+        initiator = msgs[0]
+
+        topics.append({
+            "topic_id":            tid,
+            "topic_name":          llm_info.get("name", f"Topic {tid}"),
+            "topic_keywords":      llm_info.get("keywords", []),
+            "groq_insight":        llm_info.get("insight", ""),
+            "message_count":       len(msgs),
+            "unique_users":        len(user_counter),
+            "top_participants":    top_participants,
+            "initiator_user_id":   initiator["user_id"],
+            "initiator_username":  initiator["username"],
+            "first_message_at":    first_ts,
+            "last_message_at":     last_ts,
+            "duration_minutes":    duration,
+            "peak_hour":           peak_hour,
+            "sentiment_dist": {
+                "positive": round(pos_frac, 3),
+                "neutral":  round(neu_frac, 3),
+                "negative": round(neg_frac, 3),
+            },
+            "tension_score":       round(tension, 4),
+            "needs_moderation":    tension > 0.40,
+            "reply_density":       round(reply_density, 3),
+            "positive_fraction":   round(pos_frac, 3),
+            "engagement_score":    0,  # Computed in Step 5
+            "message_ids":         [m["message_id"] for m in msgs],
+        })
+
+    return topics
+
+
+# ── Summary JSON Builder ─────────────────────────────────────────────────────
+
+def _build_summary_json(
+    target_date: str,
+    messages: list[dict],
+    topic_meta_list: list[dict],
+    user_stats: list[dict],
+    result_by_id: dict,
+) -> dict:
+    """Build the structured summary JSON sent to Groq API 2 for narrative generation."""
+    # Overall sentiment
+    all_sentiments = [
+        result_by_id.get(m["message_id"], {}).get("sentiment", "neutral")
+        for m in messages
+    ]
+    n_sent = len(all_sentiments) or 1
+    overall_pos = sum(1 for s in all_sentiments if s == "positive") / n_sent
+    overall_neg = sum(1 for s in all_sentiments if s == "negative") / n_sent
+    overall_neu = 1.0 - overall_pos - overall_neg
+
+    return {
+        "date":           target_date,
+        "total_messages": len(messages),
+        "total_users":    len(set(m["user_id"] for m in messages)),
+        "total_topics":   len(topic_meta_list),
+        "overall_sentiment": {
+            "positive": round(overall_pos, 3),
+            "neutral":  round(overall_neu, 3),
+            "negative": round(overall_neg, 3),
+        },
+        "top_topics": [
+            {
+                "rank":             t["topic_rank"],
+                "name":             t["topic_name"],
+                "keywords":         t["topic_keywords"][:5],
+                "initiator":        t["initiator_username"],
+                "message_count":    t["message_count"],
+                "unique_users":     t["unique_users"],
+                "duration_minutes": round(t["duration_minutes"], 1),
+                "engagement_score": round(t["engagement_score"], 3),
+                "sentiment":        t["sentiment_dist"],
+                "tension_score":    t.get("tension_score", 0),
+                "needs_moderation": t.get("needs_moderation", False),
+                "peak_hour":        t["peak_hour"],
+                "top_participants": [p["username"] for p in t["top_participants"][:5]],
+                "groq_insight":     t.get("groq_insight", ""),
+            }
+            for t in topic_meta_list[:15]
+        ],
+        "most_active_users": sorted(
+            user_stats, key=lambda u: u["message_count"], reverse=True
+        )[:10],
+    }
+
+
 # ── Chart Data Builder ────────────────────────────────────────────────────────
 
 def build_chart_data(
     messages: list[dict],
     topic_meta_list: list[dict],
-    sent_by_id: dict,
+    result_by_id: dict,
 ) -> dict:
     """
-    Builds structured JSON for the frontend's Recharts/Chart.js components.
-    No images, no base64 — the frontend renders everything from this JSON.
-    Response is ~15 KB vs the old matplotlib/Pillow approach (~2 MB).
+    Builds structured JSON for the frontend's Recharts components.
+    Includes per-user detailed analytics for the user dropdown feature.
     """
-    from collections import Counter, defaultdict
-    from datetime import datetime
-
     def parse_hour(ts: str) -> int:
         return datetime.fromisoformat(ts.replace("Z", "+00:00")).hour
 
@@ -272,7 +374,7 @@ def build_chart_data(
 
     # 2. Overall sentiment distribution
     all_labels = [
-        sent_by_id.get(m["message_id"], {"label": "neutral"})["label"]
+        result_by_id.get(m["message_id"], {}).get("sentiment", "neutral")
         for m in messages
     ]
     n = len(all_labels) or 1
@@ -282,13 +384,13 @@ def build_chart_data(
         "negative": round(all_labels.count("negative") / n, 3),
     }
 
-    # 3. Sentiment breakdown per hour (for stacked area / bar chart)
+    # 3. Sentiment breakdown per hour
     hour_buckets: dict[int, dict] = defaultdict(
         lambda: {"positive": 0, "neutral": 0, "negative": 0, "total": 0}
     )
     for m in messages:
         h = parse_hour(m["created_at"])
-        label = sent_by_id.get(m["message_id"], {"label": "neutral"})["label"]
+        label = result_by_id.get(m["message_id"], {}).get("sentiment", "neutral")
         hour_buckets[h][label] += 1
         hour_buckets[h]["total"] += 1
 
@@ -304,7 +406,7 @@ def build_chart_data(
             "count":    d["total"],
         })
 
-    # 4. Topic engagement ranking (top 20 for bar chart)
+    # 4. Topic engagement ranking (top 20)
     topic_engagement = [
         {
             "name":             t["topic_name"],
@@ -320,20 +422,95 @@ def build_chart_data(
         for t in topic_meta_list[:20]
     ]
 
-    # 5. Top 15 users by message count (for horizontal bar chart)
+    # 5. Top 15 users by message count
     user_counts = Counter(m["username"] for m in messages)
     user_activity = [
         {"username": username, "message_count": count}
         for username, count in user_counts.most_common(15)
     ]
 
+    # 6. Per-user detailed analytics (for user dropdown)
+    user_detail = _build_user_detail(messages, result_by_id, topic_meta_list)
+
     return {
-        "hourly_volume":      hourly_volume,       # [{hour, count}] × 24
-        "sentiment_overview": sentiment_overview,  # {positive, neutral, negative}
-        "sentiment_by_hour":  sentiment_by_hour,   # [{hour, pos, neu, neg, count}] × 24
-        "topic_engagement":   topic_engagement,    # [{name, score, messages, …}] × ≤20
-        "user_activity":      user_activity,       # [{username, message_count}] × ≤15
+        "hourly_volume":      hourly_volume,
+        "sentiment_overview": sentiment_overview,
+        "sentiment_by_hour":  sentiment_by_hour,
+        "topic_engagement":   topic_engagement,
+        "user_activity":      user_activity,
+        "user_detail":        user_detail,
     }
+
+
+def _build_user_detail(
+    messages: list[dict],
+    result_by_id: dict,
+    topic_meta_list: list[dict],
+) -> dict:
+    """
+    Build per-user detailed analytics for the user dropdown feature.
+
+    Returns: {
+        "username1": {
+            "hourly_activity": [{hour: 0, count: 5}, ...],
+            "sentiment": {positive: 0.3, neutral: 0.5, negative: 0.2},
+            "topics": ["Gaming Discussion", "Bug Reports"],
+            "message_count": 45,
+            "active_hours": [10, 11, 14, 15, 20, 21],
+        },
+        ...
+    }
+    """
+    # Build topic_id → topic_name lookup
+    topic_names = {t["topic_id"]: t["topic_name"] for t in topic_meta_list}
+
+    user_data: dict = defaultdict(lambda: {
+        "hourly": Counter(),
+        "sentiments": [],
+        "topic_ids": set(),
+        "message_count": 0,
+    })
+
+    for m in messages:
+        username = m["username"]
+        try:
+            hour = datetime.fromisoformat(m["created_at"].replace("Z", "+00:00")).hour
+        except (ValueError, TypeError):
+            hour = 0
+
+        r = result_by_id.get(m["message_id"], {})
+        sentiment = r.get("sentiment", "neutral")
+        topic_id = r.get("topic_id", -1)
+
+        user_data[username]["hourly"][hour] += 1
+        user_data[username]["sentiments"].append(sentiment)
+        user_data[username]["message_count"] += 1
+        if topic_id >= 0:
+            user_data[username]["topic_ids"].add(topic_id)
+
+    result = {}
+    for username, data in user_data.items():
+        sents = data["sentiments"]
+        n = len(sents) or 1
+        result[username] = {
+            "hourly_activity": [
+                {"hour": h, "count": data["hourly"].get(h, 0)}
+                for h in range(24)
+            ],
+            "sentiment": {
+                "positive": round(sents.count("positive") / n, 3),
+                "neutral":  round(sents.count("neutral")  / n, 3),
+                "negative": round(sents.count("negative") / n, 3),
+            },
+            "topics": [
+                topic_names.get(tid, f"Topic {tid}")
+                for tid in sorted(data["topic_ids"])
+            ],
+            "message_count": data["message_count"],
+            "active_hours": sorted(data["hourly"].keys()),
+        }
+
+    return result
 
 
 # ── Engagement Score ──────────────────────────────────────────────────────────
@@ -385,11 +562,9 @@ def compute_engagement_scores(topics: list[dict]) -> list[dict]:
 def compute_user_stats(
     messages: list[dict],
     topic_meta_list: list[dict],
-    sent_by_id: dict,
+    result_by_id: dict,
 ) -> list[dict]:
-    from collections import defaultdict
-    from datetime import datetime
-
+    """Compute per-user daily stats for Supabase user_daily_stats table."""
     user_data: dict = defaultdict(lambda: {
         "message_count":    0,
         "topics_initiated": 0,
@@ -407,17 +582,21 @@ def compute_user_stats(
             msg_topic_map[msg_id] = t["topic_id"]
 
     for m in messages:
-        uid  = m["user_id"]
-        hour = datetime.fromisoformat(m["created_at"].replace("Z", "+00:00")).hour
+        uid = m["user_id"]
+        try:
+            hour = datetime.fromisoformat(m["created_at"].replace("Z", "+00:00")).hour
+        except (ValueError, TypeError):
+            hour = 0
 
         user_data[uid]["message_count"]   += 1
         user_data[uid]["username"]         = m["username"]
         user_data[uid]["display_name"]     = m.get("display_name", m["username"])
         user_data[uid]["active_hours"].add(hour)
 
-        s = sent_by_id.get(m["message_id"])
-        if s:
-            user_data[uid]["sentiment_scores"].append(s["score"])
+        r = result_by_id.get(m["message_id"])
+        if r:
+            score = r.get("score", 0.5)
+            user_data[uid]["sentiment_scores"].append(score)
 
         topic_id = msg_topic_map.get(m["message_id"])
         if topic_id is not None:
@@ -483,9 +662,6 @@ def start_scheduler():
     """
     Creates and starts the APScheduler background scheduler.
     Called once at FastAPI startup (inside lifespan).
-
-    misfire_grace_time=3600: If Render restarts at midnight and misses the
-    00:05 window, APScheduler will still fire the job within the next hour.
     """
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(
