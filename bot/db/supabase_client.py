@@ -75,7 +75,7 @@ def bulk_update_message_topics(updates: list[dict]) -> None:
     ]
     Uses upsert so it's safe to re-run.
     """
-    get_client().table("messages").upsert(updates).execute()
+    get_client().table("messages").upsert(updates, on_conflict="message_id").execute()
 
 
 # ── daily_reports ─────────────────────────────────────────────────────────────
