@@ -37,9 +37,9 @@ logger = logging.getLogger(__name__)
 _client: Groq | None = None
 MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
-# Fixed batch size: 150 messages per Groq call.
-# Real-world average is ~59 tokens/message → 150 × 59 = ~9k tokens, well under 30k TPM.
-MESSAGES_PER_BATCH = 150
+# Fixed batch size: 100 messages per Groq call.
+# ~9k input tokens + ~4k output tokens = ~13k total, well under 30k TPM.
+MESSAGES_PER_BATCH = 100
 WAIT_BETWEEN_BATCHES = 65  # seconds — ensures we stay under 30k TPM
 
 
@@ -190,7 +190,7 @@ def _call_groq_with_retry(
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=4000,
+                max_tokens=8192,
                 temperature=0.3,  # Low temp for consistent structured output
             )
             return completion.choices[0].message.content
