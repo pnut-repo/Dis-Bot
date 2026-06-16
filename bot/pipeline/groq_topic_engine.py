@@ -41,7 +41,10 @@ MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 # Fixed batch size: 100 messages per Groq call.
 # ~9k input tokens + ~4k output tokens = ~13k total, well under 30k TPM.
 MESSAGES_PER_BATCH = 100
-WAIT_BETWEEN_BATCHES = 65  # seconds — ensures we stay under 30k TPM
+WAIT_BETWEEN_BATCHES = 120  # seconds — ensures we stay under 30k TPM
+
+# Supported sentiments
+VALID_SENTIMENTS = {"excited", "happy", "curious", "neutral", "frustrated", "angry", "sad", "confused"}
 
 
 def _get_client() -> Groq:
@@ -59,10 +62,10 @@ def _get_client() -> Groq:
 SYSTEM_PROMPT = """You are a Discord message analyzer. You receive batches of messages from a single day and must:
 
 1. **Group messages into conversation topics.** Messages about the same subject get the same topic_id.
-2. **Assign sentiment** to each message: "positive", "neutral", or "negative" with a confidence score 0.0-1.0.
+2. **Assign sentiment** to each message. Use one of these 8 classes: "excited", "happy", "curious", "neutral", "frustrated", "angry", "sad", "confused". Also provide a confidence score 0.0-1.0.
 3. **Name each topic** with a short descriptive title (3-6 words).
 4. **Extract keywords** for each topic (top 5 most relevant words).
-5. **Write an insight** for each topic: a 2-3 sentence summary of what was discussed, the emotional tone, and who drove the discussion.
+5. **Write an insight** for each topic: Write 2-3 sentences that answer: (1) What specifically was discussed or decided? (2) What was the emotional arc - did it start heated and cool down, or escalate? (3) Who were the key voices and what did they push for? Be concrete - reference actual message content, not generalizations.
 
 **Critical rules:**
 - This is BATCH processing. You may receive known topics from previous batches. Assign messages to existing topics if they match, or create new topics with NEW topic_ids (use the next available integer).
@@ -70,11 +73,12 @@ SYSTEM_PROMPT = """You are a Discord message analyzer. You receive batches of me
 - Messages that don't fit any topic should get topic_id: -1 (uncategorized).
 - Short messages like "lol", "ok", "yeah" should be assigned to the topic of the message they reply to (check reply_to field), or -1 if no reply context.
 - Be consistent: if batch 1 had "Gaming Discussion" as topic 0, batch 2 should reuse topic 0 for similar gaming messages.
+- `@chatrevive` and `@everyone` pings often mark the **start of a new topic**. Treat them as strong signals for a new topic_id, unless the surrounding context clearly belongs to an existing topic. Do NOT require a ping to create a new topic — organic conversations that share a clear subject should also be grouped.
 
 **Response format (STRICT JSON, no markdown fences, no extra text):**
 {
   "messages": [
-    {"id": "msg_id_here", "topic_id": 0, "sentiment": "positive", "score": 0.85},
+    {"id": "msg_id_here", "topic_id": 0, "sentiment": "frustrated", "score": 0.85},
     {"id": "msg_id_here", "topic_id": -1, "sentiment": "neutral", "score": 0.5}
   ],
   "topics": [
@@ -82,7 +86,7 @@ SYSTEM_PROMPT = """You are a Discord message analyzer. You receive batches of me
       "topic_id": 0,
       "name": "Game Balance Debate",
       "keywords": ["nerf", "pvp", "patch", "meta", "broken"],
-      "insight": "Players debated the latest balance patch. The tone was mostly frustrated, with several users calling the changes unfair. User_xyz led the discussion with 12 messages."
+      "insight": "Players debated the latest balance patch. The tone was mostly frustrated, starting with several users calling the changes unfair and escalating when User_xyz joined. User_xyz and User_abc led the discussion, pushing heavily for a revert to the previous patch."
     }
   ]
 }"""
@@ -136,6 +140,15 @@ def _build_batch_prompt(
             if parent_name:
                 entry["reply_to"] = parent_name
 
+        # Annotate pings
+        content = m.get("content", "")
+        if "@chatrevive" in content:
+            entry["ping"] = "@chatrevive"
+        elif "@everyone" in content:
+            entry["ping"] = "@everyone"
+        elif "@here" in content:
+            entry["ping"] = "@here"
+
         compact_msgs.append(entry)
 
     parts = [f"Batch {batch_number}/{total_batches}. Analyze these {len(compact_msgs)} Discord messages:"]
@@ -178,16 +191,21 @@ def _parse_response(raw: str) -> dict:
     if "messages" not in parsed or "topics" not in parsed:
         raise ValueError(f"Missing 'messages' or 'topics' key in response")
 
+    # Normalize invalid sentiments
+    for m in parsed.get("messages", []):
+        if m.get("sentiment") not in VALID_SENTIMENTS:
+            m["sentiment"] = "neutral"
+
     return parsed
 
 
 def _call_groq_with_retry(
     system: str,
     user_prompt: str,
-    max_retries: int = 3,
+    max_retries: int = 4,
 ) -> str:
     """
-    Call Groq with exponential backoff on 429 / transient errors.
+    Call Groq with exponential backoff on transient errors, and 60s sleep on 429.
     Returns raw response text.
     """
     client = _get_client()
@@ -210,7 +228,7 @@ def _call_groq_with_retry(
             if attempt == max_retries:
                 raise
 
-            wait = (2 ** attempt) * 30 if is_rate_limit else 5
+            wait = 60 if is_rate_limit else (2 ** attempt) * 5
             logger.warning(
                 f"Groq call failed (attempt {attempt}/{max_retries}): {e}. "
                 f"Retrying in {wait}s..."
@@ -269,6 +287,7 @@ def analyze_messages(messages: list[dict]) -> dict:
     all_msg_results: list[dict] = []
     all_topics: list[dict] = []
     known_topics: list[dict] = []  # Accumulates across batches for consistency
+    batch_reports: list[dict] = []
 
     for batch_idx, batch in enumerate(batches):
         batch_num = batch_idx + 1
@@ -322,6 +341,32 @@ def analyze_messages(messages: list[dict]) -> dict:
                 }
                 for t in all_topics
             ]
+
+            # Build per-batch report
+            times = [m.get("created_at", "")[11:16] for m in batch if m.get("created_at")]
+            time_range = f"{min(times)}–{max(times)}" if times else "Unknown"
+
+            new_topics_names = []
+            topic_updates_names = []
+            for bt in batch_topics:
+                t_name = bt.get("name", f"Topic {bt.get('topic_id', -1)}")
+                if bt.get("topic_id") in existing_ids:
+                    topic_updates_names.append(t_name)
+                else:
+                    new_topics_names.append(t_name)
+
+            sentiment_snapshot = defaultdict(int)
+            for m in batch_msgs:
+                sentiment_snapshot[m.get("sentiment", "neutral")] += 1
+
+            batch_reports.append({
+                "batch": batch_num,
+                "message_range": time_range,
+                "new_topics": new_topics_names,
+                "topic_updates": topic_updates_names,
+                "message_count": len(batch_msgs),
+                "sentiment_snapshot": dict(sentiment_snapshot)
+            })
 
             logger.info(
                 f"Batch {batch_num} complete: "
@@ -394,6 +439,7 @@ def analyze_messages(messages: list[dict]) -> dict:
         "n_topics": n_topics,
         "uncategorized_count": n_uncategorized,
         "processing_time_seconds": processing_time,
+        "batch_reports": batch_reports,
     }
 
 
@@ -408,4 +454,5 @@ def _fallback_result(messages: list[dict]) -> dict:
         "n_topics": 0,
         "uncategorized_count": len(messages),
         "processing_time_seconds": 0,
+        "batch_reports": [],
     }

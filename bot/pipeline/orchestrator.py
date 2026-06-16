@@ -131,8 +131,9 @@ def run_daily_pipeline():
 
         # ── Step 8: Build summary JSON for Groq API 2 ────────────────────────
         logger.info("Step 8: Building Groq summary JSON")
+        batch_reports = groq_result.get("batch_reports", [])
         summary_json = _build_summary_json(
-            target_date, messages, topic_meta_list, user_stats, result_by_id
+            target_date, messages, topic_meta_list, user_stats, result_by_id, batch_reports
         )
 
         # ── Step 9: Groq API 2 — Narrative Report ─────────────────────────────
@@ -255,12 +256,13 @@ def _build_topic_metadata(
         ]
         sent_counter = Counter(sentiments)
         n_sent = len(sentiments) or 1
-        pos_frac = sent_counter.get("positive", 0) / n_sent
-        neg_frac = sent_counter.get("negative", 0) / n_sent
-        neu_frac = sent_counter.get("neutral", 0) / n_sent
+        sentiment_dist = {
+            s: round(sent_counter.get(s, 0) / n_sent, 3)
+            for s in ["excited", "happy", "curious", "neutral", "frustrated", "angry", "sad", "confused"]
+        }
 
         # Tension score
-        tension = neg_frac + 0.3 * neu_frac
+        tension = sentiment_dist["angry"] + sentiment_dist["frustrated"] + 0.5 * sentiment_dist["sad"] + 0.3 * sentiment_dist["neutral"]
 
         # Reply density
         reply_count = sum(1 for m in msgs if m.get("is_reply") or m.get("reply_to_id"))
@@ -283,15 +285,11 @@ def _build_topic_metadata(
             "last_message_at":     last_ts,
             "duration_minutes":    duration,
             "peak_hour":           peak_hour,
-            "sentiment_dist": {
-                "positive": round(pos_frac, 3),
-                "neutral":  round(neu_frac, 3),
-                "negative": round(neg_frac, 3),
-            },
+            "sentiment_dist":      sentiment_dist,
             "tension_score":       round(tension, 4),
             "needs_moderation":    tension > 0.40,
             "reply_density":       round(reply_density, 3),
-            "positive_fraction":   round(pos_frac, 3),
+            "positive_fraction":   round(sentiment_dist["excited"] + sentiment_dist["happy"], 3),
             "engagement_score":    0,  # Computed in Step 5
             "message_ids":         [m["message_id"] for m in msgs],
         })
@@ -307,6 +305,7 @@ def _build_summary_json(
     topic_meta_list: list[dict],
     user_stats: list[dict],
     result_by_id: dict,
+    batch_reports: list[dict] = None,
 ) -> dict:
     """Build the structured summary JSON sent to Groq API 2 for narrative generation."""
     # Overall sentiment
@@ -315,20 +314,19 @@ def _build_summary_json(
         for m in messages
     ]
     n_sent = len(all_sentiments) or 1
-    overall_pos = sum(1 for s in all_sentiments if s == "positive") / n_sent
-    overall_neg = sum(1 for s in all_sentiments if s == "negative") / n_sent
-    overall_neu = 1.0 - overall_pos - overall_neg
+    sent_counter = Counter(all_sentiments)
+    overall_sentiment = {
+        s: round(sent_counter.get(s, 0) / n_sent, 3)
+        for s in ["excited", "happy", "curious", "neutral", "frustrated", "angry", "sad", "confused"]
+    }
 
     return {
         "date":           target_date,
         "total_messages": len(messages),
         "total_users":    len(set(m["user_id"] for m in messages)),
         "total_topics":   len(topic_meta_list),
-        "overall_sentiment": {
-            "positive": round(overall_pos, 3),
-            "neutral":  round(overall_neu, 3),
-            "negative": round(overall_neg, 3),
-        },
+        "overall_sentiment": overall_sentiment,
+        "batch_reports": (batch_reports or [])[-10:],
         "top_topics": [
             {
                 "rank":             t["topic_rank"],
@@ -346,7 +344,7 @@ def _build_summary_json(
                 "top_participants": [p["username"] for p in t["top_participants"][:5]],
                 "groq_insight":     t.get("groq_insight", ""),
             }
-            for t in topic_meta_list[:15]
+            for t in topic_meta_list[:10]
         ],
         "most_active_users": sorted(
             user_stats, key=lambda u: u["message_count"], reverse=True
@@ -378,19 +376,21 @@ def build_chart_data(
         for m in messages
     ]
     n = len(all_labels) or 1
+    label_counts = Counter(all_labels)
     sentiment_overview = {
-        "positive": round(all_labels.count("positive") / n, 3),
-        "neutral":  round(all_labels.count("neutral")  / n, 3),
-        "negative": round(all_labels.count("negative") / n, 3),
+        s: round(label_counts.get(s, 0) / n, 3)
+        for s in ["excited", "happy", "curious", "neutral", "frustrated", "angry", "sad", "confused"]
     }
 
     # 3. Sentiment breakdown per hour
     hour_buckets: dict[int, dict] = defaultdict(
-        lambda: {"positive": 0, "neutral": 0, "negative": 0, "total": 0}
+        lambda: {"excited": 0, "happy": 0, "curious": 0, "neutral": 0, "frustrated": 0, "angry": 0, "sad": 0, "confused": 0, "total": 0}
     )
     for m in messages:
         h = parse_hour(m["created_at"])
         label = result_by_id.get(m["message_id"], {}).get("sentiment", "neutral")
+        if label not in hour_buckets[h]:
+            label = "neutral"
         hour_buckets[h][label] += 1
         hour_buckets[h]["total"] += 1
 
@@ -398,13 +398,10 @@ def build_chart_data(
     for h in range(24):
         d = hour_buckets[h]
         total = d["total"] or 1
-        sentiment_by_hour.append({
-            "hour":     h,
-            "positive": round(d["positive"] / total, 3),
-            "neutral":  round(d["neutral"]  / total, 3),
-            "negative": round(d["negative"] / total, 3),
-            "count":    d["total"],
-        })
+        hour_data = {"hour": h, "count": d["total"]}
+        for s in ["excited", "happy", "curious", "neutral", "frustrated", "angry", "sad", "confused"]:
+            hour_data[s] = round(d[s] / total, 3)
+        sentiment_by_hour.append(hour_data)
 
     # 4. Topic engagement ranking (top 20)
     topic_engagement = [
@@ -498,9 +495,8 @@ def _build_user_detail(
                 for h in range(24)
             ],
             "sentiment": {
-                "positive": round(sents.count("positive") / n, 3),
-                "neutral":  round(sents.count("neutral")  / n, 3),
-                "negative": round(sents.count("negative") / n, 3),
+                s: round(sents.count(s) / n, 3)
+                for s in ["excited", "happy", "curious", "neutral", "frustrated", "angry", "sad", "confused"]
             },
             "topics": [
                 topic_names.get(tid, f"Topic {tid}")
